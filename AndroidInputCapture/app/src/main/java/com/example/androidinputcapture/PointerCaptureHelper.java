@@ -8,12 +8,14 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.View.OnCapturedPointerListener;
+import android.view.View.OnGenericMotionListener;
 import android.view.WindowManager; // Import WindowManager
 
 import androidx.annotation.NonNull;
@@ -26,6 +28,9 @@ import java.lang.ref.WeakReference;
 public class PointerCaptureHelper implements Application.ActivityLifecycleCallbacks {
     private static final String TAG = "PointerCaptureHelper";
     private static final PointerCaptureHelper INSTANCE = new PointerCaptureHelper();
+    private static final Object inputLock = new Object();
+    private static final boolean DEBUG_MOUSE_LOOK = false;
+    private static final long DEBUG_LOG_INTERVAL_MS = 250;
 
     private static volatile float lastDx = 0, lastDy = 0;
     // Use a queue or list for button presses and scroll deltas if needed,
@@ -34,6 +39,7 @@ public class PointerCaptureHelper implements Application.ActivityLifecycleCallba
     private static volatile int lastActionButton = 0; // Button that triggered the action
     private static volatile float lastVerticalScrollDelta = 0;
     private static volatile float lastHorizontalScrollDelta = 0;
+    private static long nextMouseLookDebugLogTime = 0;
 
 
     private static volatile boolean captureRequested = false;
@@ -46,13 +52,11 @@ public class PointerCaptureHelper implements Application.ActivityLifecycleCallba
     private static boolean initialized = false;
 
     private OnCapturedPointerListener capturedPointerListener = null;
+    private OnGenericMotionListener genericMotionListener = null;
 
     private PointerCaptureHelper() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             capturedPointerListener = (@NonNull View view, @NonNull MotionEvent event) -> {
-                 Log.d(TAG, "onCapturedPointer event received: action=" + event.getAction() +
-                 ", source=" + event.getSource() + ", buttonState=" + event.getButtonState());
-
                 // First event confirms capture is active after request
                 if (captureRequested && !hasCaptureConfirmed) {
                     Log.d(TAG, "onCapturedPointer: Capture confirmed by first event.");
@@ -63,46 +67,100 @@ public class PointerCaptureHelper implements Application.ActivityLifecycleCallba
                     return false;
                 }
 
-                int source = event.getSource();
-                int action = event.getAction();
-
-
-                // Handle relative mouse movement
-                if (source == InputDevice.SOURCE_MOUSE_RELATIVE || source == InputDevice.SOURCE_TOUCHPAD) {
-                    if (action == MotionEvent.ACTION_MOVE) {
-                        lastDx = event.getX();
-                        lastDy = event.getY();
-                         Log.v(TAG, "Captured Relative Move: dx=" + lastDx + ", dy=" + lastDy);
-                    }
-                }
-
-                // Handle mouse button presses and releases
-                lastButtonState = event.getButtonState();
-                if (action == MotionEvent.ACTION_BUTTON_PRESS || action == MotionEvent.ACTION_BUTTON_RELEASE) {
-                    lastActionButton = event.getActionButton();
-                     Log.d(TAG, "Captured Button State Change: action=" + action +
-                            ", button=" + lastActionButton + ", state=" + lastButtonState);
-                }
-
-                // Handle scroll wheel
-                if (action == MotionEvent.ACTION_SCROLL) {
-                    // Check for vertical scroll
-                    if (event.getAxisValue(MotionEvent.AXIS_VSCROLL) != 0) {
-                        lastVerticalScrollDelta = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
-                         Log.d(TAG, "Captured Vertical Scroll: delta=" + lastVerticalScrollDelta);
-                    }
-                    // Check for horizontal scroll
-                    if (event.getAxisValue(MotionEvent.AXIS_HSCROLL) != 0) {
-                        lastHorizontalScrollDelta = event.getAxisValue(MotionEvent.AXIS_HSCROLL);
-                        Log.d(TAG, "Captured Horizontal Scroll: delta=" + lastHorizontalScrollDelta);
-                    }
-                }
-
-                // By default, return false so that the event may continue to be processed
-                // if not explicitly consumed by the helper.
-                return false;
+                processPointerEvent(event, true);
+                return true;
             };
         }
+
+        genericMotionListener = (@NonNull View view, @NonNull MotionEvent event) -> {
+            processPointerEvent(event, false);
+            return false;
+        };
+    }
+
+    private static void processPointerEvent(@NonNull MotionEvent event, boolean includeRelativeMovement) {
+        int action = event.getAction();
+
+        if (includeRelativeMovement && (event.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE) || event.isFromSource(InputDevice.SOURCE_TOUCHPAD))) {
+            if (action == MotionEvent.ACTION_MOVE) {
+                float dx = 0;
+                float dy = 0;
+                float currentX = event.getX();
+                float currentY = event.getY();
+                float currentAxisX = event.getAxisValue(MotionEvent.AXIS_RELATIVE_X);
+                float currentAxisY = event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y);
+
+                if (event.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE)) {
+                    for (int i = 0; i < event.getHistorySize(); i++) {
+                        dx += event.getHistoricalX(i);
+                        dy += event.getHistoricalY(i);
+                    }
+                    dx += event.getX();
+                    dy += event.getY();
+                } else {
+                    for (int i = 0; i < event.getHistorySize(); i++) {
+                        dx += event.getHistoricalAxisValue(MotionEvent.AXIS_RELATIVE_X, i);
+                        dy += event.getHistoricalAxisValue(MotionEvent.AXIS_RELATIVE_Y, i);
+                    }
+                    dx += event.getAxisValue(MotionEvent.AXIS_RELATIVE_X);
+                    dy += event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y);
+                }
+
+                synchronized (inputLock) {
+                    lastDx += dx;
+                    lastDy += dy;
+                }
+
+                logMouseLookDebug(event, dx, dy, currentX, currentY, currentAxisX, currentAxisY);
+            }
+        }
+
+        synchronized (inputLock) {
+            lastButtonState = event.getButtonState();
+        }
+        if (action == MotionEvent.ACTION_BUTTON_PRESS || action == MotionEvent.ACTION_BUTTON_RELEASE) {
+            synchronized (inputLock) {
+                lastActionButton = event.getActionButton();
+            }
+        }
+
+        if (action == MotionEvent.ACTION_SCROLL) {
+            float verticalScroll = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
+            float horizontalScroll = event.getAxisValue(MotionEvent.AXIS_HSCROLL);
+            synchronized (inputLock) {
+                lastVerticalScrollDelta += verticalScroll;
+                lastHorizontalScrollDelta += horizontalScroll;
+            }
+        }
+    }
+
+    private static void logMouseLookDebug(
+            @NonNull MotionEvent event,
+            float dx,
+            float dy,
+            float currentX,
+            float currentY,
+            float currentAxisX,
+            float currentAxisY) {
+        if (!DEBUG_MOUSE_LOOK || dx == 0 && dy == 0) {
+            return;
+        }
+
+        long now = SystemClock.uptimeMillis();
+        if (now < nextMouseLookDebugLogTime) {
+            return;
+        }
+
+        nextMouseLookDebugLogTime = now + DEBUG_LOG_INTERVAL_MS;
+        Log.d(TAG, "ML_NATIVE"
+                + " source=0x" + Integer.toHexString(event.getSource())
+                + " mouseRelative=" + event.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE)
+                + " touchpad=" + event.isFromSource(InputDevice.SOURCE_TOUCHPAD)
+                + " history=" + event.getHistorySize()
+                + " get=(" + currentX + "," + currentY + ")"
+                + " axis=(" + currentAxisX + "," + currentAxisY + ")"
+                + " used=(" + dx + "," + dy + ")"
+                + " accumulated=(" + lastDx + "," + lastDy + ")");
     }
 
     public static void initialize(@NonNull Context context) {
@@ -210,6 +268,7 @@ public class PointerCaptureHelper implements Application.ActivityLifecycleCallba
                 currentUnityView.setFocusableInTouchMode(true);
                 // THIS IS THE KEY: Attach the listener
                 currentUnityView.setOnCapturedPointerListener(capturedPointerListener);
+                currentUnityView.setOnGenericMotionListener(genericMotionListener);
                 unityViewRef = new WeakReference<>(currentUnityView);
 
             } else {
@@ -227,6 +286,7 @@ public class PointerCaptureHelper implements Application.ActivityLifecycleCallba
             if (view != null) {
                 Log.d(TAG, "tryDetachListener: Detaching listener from view: " + view);
                 view.setOnCapturedPointerListener(null);
+                view.setOnGenericMotionListener(null);
             } else {
                 Log.d(TAG, "tryDetachListener: No view ref found to detach listener from.");
             }
@@ -268,12 +328,14 @@ public class PointerCaptureHelper implements Application.ActivityLifecycleCallba
         }
         captureRequested = false;
         hasCaptureConfirmed = false;
-        lastDx = 0;
-        lastDy = 0;
-        lastButtonState = 0;
-        lastActionButton = 0;
-        lastVerticalScrollDelta = 0;
-        lastHorizontalScrollDelta = 0;
+        synchronized (inputLock) {
+            lastDx = 0;
+            lastDy = 0;
+            lastButtonState = 0;
+            lastActionButton = 0;
+            lastVerticalScrollDelta = 0;
+            lastHorizontalScrollDelta = 0;
+        }
     }
 
     // --- Static Methods for Unity ---
@@ -287,12 +349,14 @@ public class PointerCaptureHelper implements Application.ActivityLifecycleCallba
         Log.d(TAG, "beginCapture: Called from Unity. Requesting capture...");
         captureRequested = true; // Mark as requested
         hasCaptureConfirmed = false; // Reset confirmation status
-        lastDx = 0; // Reset deltas on new request
-        lastDy = 0;
-        lastButtonState = 0; // Reset button state
-        lastActionButton = 0; // Reset action button
-        lastVerticalScrollDelta = 0; // Reset scroll deltas
-        lastHorizontalScrollDelta = 0;
+        synchronized (inputLock) {
+            lastDx = 0; // Reset deltas on new request
+            lastDy = 0;
+            lastButtonState = 0; // Reset button state
+            lastActionButton = 0; // Reset action button
+            lastVerticalScrollDelta = 0; // Reset scroll deltas
+            lastHorizontalScrollDelta = 0;
+        }
 
 
         Activity activity = INSTANCE.currentActivityRef.get();
@@ -415,15 +479,19 @@ public class PointerCaptureHelper implements Application.ActivityLifecycleCallba
     }
 
     public static float getLastDx() {
-        float tmp = lastDx;
-        lastDx = 0; // Consume the delta
-        return tmp;
+        synchronized (inputLock) {
+            float tmp = lastDx;
+            lastDx = 0; // Consume the delta
+            return tmp;
+        }
     }
 
     public static float getLastDy() {
-        float tmp = lastDy;
-        lastDy = 0; // Consume the delta
-        return tmp;
+        synchronized (inputLock) {
+            float tmp = lastDy;
+            lastDy = 0; // Consume the delta
+            return tmp;
+        }
     }
 
     /**
@@ -431,7 +499,9 @@ public class PointerCaptureHelper implements Application.ActivityLifecycleCallba
      * See MotionEvent.getButtonState() for button constants (e.g., MotionEvent.BUTTON_PRIMARY).
      */
     public static int getLastButtonState() {
-        return lastButtonState;
+        synchronized (inputLock) {
+            return lastButtonState;
+        }
     }
 
     /**
@@ -439,9 +509,11 @@ public class PointerCaptureHelper implements Application.ActivityLifecycleCallba
      * See MotionEvent.getActionButton() for button constants.
      */
     public static int getLastActionButton() {
-        int tmp = lastActionButton;
-        lastActionButton = 0; // Consume the action button
-        return tmp;
+        synchronized (inputLock) {
+            int tmp = lastActionButton;
+            lastActionButton = 0; // Consume the action button
+            return tmp;
+        }
     }
 
     /**
@@ -449,9 +521,11 @@ public class PointerCaptureHelper implements Application.ActivityLifecycleCallba
      * Value is typically -1.0 for down, 1.0 for up.
      */
     public static float getLastVerticalScrollDelta() {
-        float tmp = lastVerticalScrollDelta;
-        lastVerticalScrollDelta = 0; // Consume the delta
-        return tmp;
+        synchronized (inputLock) {
+            float tmp = lastVerticalScrollDelta;
+            lastVerticalScrollDelta = 0; // Consume the delta
+            return tmp;
+        }
     }
 
     /**
@@ -459,9 +533,11 @@ public class PointerCaptureHelper implements Application.ActivityLifecycleCallba
      * Value depends on the input device, often -1.0 for left, 1.0 for right.
      */
     public static float getLastHorizontalScrollDelta() {
-        float tmp = lastHorizontalScrollDelta;
-        lastHorizontalScrollDelta = 0; // Consume the delta
-        return tmp;
+        synchronized (inputLock) {
+            float tmp = lastHorizontalScrollDelta;
+            lastHorizontalScrollDelta = 0; // Consume the delta
+            return tmp;
+        }
     }
 
 
